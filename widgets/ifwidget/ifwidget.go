@@ -1,4 +1,4 @@
-// Copyright 2019 Graham Clark. All rights reserved.  Use of this source
+// Copyright 2019-2020 Graham Clark. All rights reserved.  Use of this source
 // code is governed by the MIT license that can be found in the LICENSE
 // file.
 
@@ -68,9 +68,9 @@ func (w *Widget) Selectable() bool {
 
 func (w *Widget) UserInput(ev interface{}, size gowid.IRenderSize, focus gowid.Selector, app gowid.IApp) bool {
 	if w.pred() {
-		return gowid.UserInput(w.wtrue, ev, size, focus, app)
+		return w.wtrue.UserInput(ev, size, focus, app)
 	} else {
-		return gowid.UserInput(w.wfalse, ev, size, focus, app)
+		return w.wfalse.UserInput(ev, size, focus, app)
 	}
 }
 
@@ -84,9 +84,9 @@ func (w *Widget) RenderSize(size gowid.IRenderSize, focus gowid.Selector, app go
 
 func (w *Widget) Render(size gowid.IRenderSize, focus gowid.Selector, app gowid.IApp) gowid.ICanvas {
 	if w.pred() {
-		return gowid.Render(w.wtrue, size, focus, app)
+		return w.wtrue.Render(size, focus, app)
 	} else {
-		return gowid.Render(w.wfalse, size, focus, app)
+		return w.wfalse.Render(size, focus, app)
 	}
 }
 

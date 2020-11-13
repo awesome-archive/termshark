@@ -1,4 +1,4 @@
-// Copyright 2019 Graham Clark. All rights reserved.  Use of this source
+// Copyright 2019-2020 Graham Clark. All rights reserved.  Use of this source
 // code is governed by the MIT license that can be found in the LICENSE
 // file.
 
@@ -6,6 +6,7 @@ package termshark
 
 import (
 	"bufio"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -38,14 +39,18 @@ func NewFields() *TSharkFields {
 	return &TSharkFields{}
 }
 
+func DeleteCachedFields() error {
+	return os.Remove(CacheFile("tsharkfieldsv2.gob.gz"))
+}
+
 // Can be run asynchronously.
 // This ought to use interfaces to make it testable.
 func (w *TSharkFields) Init() error {
-	newer, err := FileNewerThan(CacheFile("tsharkfields.gob.gz"), DirOfPathCommandUnsafe(TSharkBin()))
+	newer, err := FileNewerThan(CacheFile("tsharkfieldsv2.gob.gz"), DirOfPathCommandUnsafe(TSharkBin()))
 	if err == nil {
 		if newer {
 			f := &mapOrString{}
-			err = ReadGob(CacheFile("tsharkfields.gob.gz"), f)
+			err = ReadGob(CacheFile("tsharkfieldsv2.gob.gz"), f)
 			if err == nil {
 				w.fields = f
 				log.Infof("Read cached tshark fields.")
@@ -56,6 +61,20 @@ func (w *TSharkFields) Init() error {
 		}
 	}
 
+	err = w.InitNoCache()
+	if err != nil {
+		return err
+	}
+
+	err = WriteGob(CacheFile("tsharkfieldsv2.gob.gz"), w.fields)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (w *TSharkFields) InitNoCache() error {
 	cmd := exec.Command(TSharkBin(), []string{"-G", "fields"}...)
 
 	out, err := cmd.StdoutPipe()
@@ -72,23 +91,25 @@ func (w *TSharkFields) Init() error {
 	scanner := bufio.NewScanner(out)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "F") {
+		if strings.HasPrefix(line, "F") { // Wireshark field
 			fields := strings.Split(line, "\t")
 			field := fields[2]
-			protos := strings.Split(field, ".")
-			cur := top
-			for i := 0; i < len(protos); i++ {
-				if val, ok := cur.M[protos[i]]; ok {
-					cur = val
-				} else {
-					next := &mapOrString{
-						M: make(map[string]*mapOrString),
+			protos := strings.SplitN(field, ".", 2)
+			if len(protos) > 1 {
+				cur := top
+				for i := 0; i < len(protos); i++ {
+					if val, ok := cur.M[protos[i]]; ok {
+						cur = val
+					} else {
+						next := &mapOrString{
+							M: make(map[string]*mapOrString),
+						}
+						cur.M[protos[i]] = next
+						cur = next
 					}
-					cur.M[protos[i]] = next
-					cur = next
 				}
 			}
-		} else if strings.HasPrefix(line, "P") {
+		} else if strings.HasPrefix(line, "P") { // Wireshark protocol
 			fields := strings.Split(line, "\t")
 			field := fields[2]
 			if _, ok := top.M[field]; !ok {
@@ -101,11 +122,6 @@ func (w *TSharkFields) Init() error {
 	}
 
 	cmd.Wait()
-
-	err = WriteGob(CacheFile("tsharkfields.gob.gz"), top)
-	if err != nil {
-		return err
-	}
 
 	w.fields = top
 
@@ -138,7 +154,7 @@ func (t *TSharkFields) Completions(prefix string, cb IPrefixCompleterCallback) {
 		}
 	}
 
-	fields := strings.Split(field, ".")
+	fields := strings.SplitN(field, ".", 2)
 
 	prefs := make([]string, 0, 10)
 	cur := t.fields.M

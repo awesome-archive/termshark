@@ -1,4 +1,4 @@
-// Copyright 2019 Graham Clark. All rights reserved.  Use of this source
+// Copyright 2019-2020 Graham Clark. All rights reserved.  Use of this source
 // code is governed by the MIT license that can be found in the LICENSE
 // file.
 
@@ -10,28 +10,40 @@ import (
 	"compress/gzip"
 	"encoding/binary"
 	"encoding/gob"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"text/template"
 	"time"
+	"unicode"
 
-	"github.com/gcla/gowid"
+	"github.com/adam-hanna/arrayOperations"
 	"github.com/blang/semver"
+	"github.com/gcla/gowid"
+	"github.com/gcla/gowid/gwutil"
+	"github.com/gcla/gowid/vim"
+	"github.com/gcla/termshark/v2/system"
+	"github.com/gcla/termshark/v2/widgets/resizable"
+	"github.com/gdamore/tcell"
+	"github.com/mattn/go-isatty"
 	"github.com/pkg/errors"
 	"github.com/shibukawa/configdir"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
+	"github.com/tevino/abool"
 )
 
 //======================================================================
@@ -45,6 +57,51 @@ func (e BadStateError) Error() string {
 }
 
 var BadState = BadStateError{}
+
+//======================================================================
+
+type BadCommandError struct{}
+
+var _ error = BadCommandError{}
+
+func (e BadCommandError) Error() string {
+	return "Error running command"
+}
+
+var BadCommand = BadCommandError{}
+
+//======================================================================
+
+type ConfigError struct{}
+
+var _ error = ConfigError{}
+
+func (e ConfigError) Error() string {
+	return "Configuration error"
+}
+
+var ConfigErr = ConfigError{}
+
+//======================================================================
+
+type InternalError struct{}
+
+var _ error = InternalError{}
+
+func (e InternalError) Error() string {
+	return "Internal error"
+}
+
+var InternalErr = InternalError{}
+
+//======================================================================
+
+var (
+	UserGuideURL string = "https://termshark.io/userguide"
+	FAQURL       string = "https://termshark.io/faq"
+	BugURL       string = "https://github.com/gcla/termshark/issues/new?assignees=&labels=&template=bug_report.md&title="
+	FeatureURL   string = "https://github.com/gcla/termshark/issues/new?assignees=&labels=&template=feature_request.md&title="
+)
 
 //======================================================================
 
@@ -65,23 +122,20 @@ func DirOfPathCommand(bin string) (string, error) {
 	return exec.LookPath(bin)
 }
 
-func TSharkBin() string {
-	return ConfString("main.tshark", "tshark")
-}
+//======================================================================
 
-func DumpcapBin() string {
-	return ConfString("main.dumpcap", "dumpcap")
-}
+// The config is accessed by the main goroutine and pcap loading goroutines. So this
+// is an attempt to prevent warnings with the -race flag (though they are very likely
+// harmless)
+var confMutex sync.Mutex
 
-func TailCommand() []string {
-	def := []string{"tail", "-f", "-c", "+0"}
-	if runtime.GOOS == "windows" {
-		def[0] = "c:\\cygwin64\\bin\\tail.exe"
-	}
-	return ConfStringSlice("main.tail-command", def)
+func ConfKeyExists(name string) bool {
+	return viper.Get(name) != nil
 }
 
 func ConfString(name string, def string) string {
+	confMutex.Lock()
+	defer confMutex.Unlock()
 	if viper.Get(name) != nil {
 		return viper.GetString(name)
 	} else {
@@ -89,13 +143,61 @@ func ConfString(name string, def string) string {
 	}
 }
 
+func SetConf(name string, val interface{}) {
+	confMutex.Lock()
+	defer confMutex.Unlock()
+	viper.Set(name, val)
+	viper.WriteConfig()
+}
+
+func ConfStrings(name string) []string {
+	confMutex.Lock()
+	defer confMutex.Unlock()
+	return viper.GetStringSlice(name)
+}
+
+func DeleteConf(name string) {
+	confMutex.Lock()
+	defer confMutex.Unlock()
+	viper.Set(name, "")
+	viper.WriteConfig()
+}
+
 func ConfInt(name string, def int) int {
+	confMutex.Lock()
+	defer confMutex.Unlock()
 	if viper.Get(name) != nil {
 		return viper.GetInt(name)
 	} else {
 		return def
 	}
 }
+
+func ConfBool(name string, def ...bool) bool {
+	confMutex.Lock()
+	defer confMutex.Unlock()
+	if viper.Get(name) != nil {
+		return viper.GetBool(name)
+	} else {
+		if len(def) > 0 {
+			return def[0]
+		} else {
+			return false
+		}
+	}
+}
+
+func ConfStringSlice(name string, def []string) []string {
+	confMutex.Lock()
+	defer confMutex.Unlock()
+	res := viper.GetStringSlice(name)
+	if res == nil {
+		res = def
+	}
+	return res
+}
+
+//======================================================================
 
 var TSharkVersionUnknown = fmt.Errorf("Could not determine version of tshark")
 
@@ -124,10 +226,71 @@ func TSharkVersion(tshark string) (semver.Version, error) {
 	return TSharkVersionFromOutput(string(output))
 }
 
-func RunForExitCode(prog string, args ...string) (int, error) {
+// Depends on empty.pcap being present
+func TSharkSupportsColor(tshark string) (bool, error) {
+	exitCode, err := RunForExitCode(
+		tshark,
+		[]string{"-r", CacheFile("empty.pcap"), "-T", "psml", "--color"},
+		nil,
+	)
+	return exitCode == 0, err
+}
+
+// TSharkPath will return the full path of the tshark binary, if it's found in the path, otherwise an error
+func TSharkPath() (string, *gowid.KeyValueError) {
+	tsharkBin := ConfString("main.tshark", "")
+	if tsharkBin != "" {
+		confirmedTshark := false
+		if _, err := os.Stat(tsharkBin); err == nil {
+			confirmedTshark = true
+		} else if IsCommandInPath(tsharkBin) {
+			confirmedTshark = true
+		}
+		// This message is for a configured tshark binary that is invalid
+		if !confirmedTshark {
+			err := gowid.WithKVs(ConfigErr, map[string]interface{}{
+				"msg": fmt.Sprintf("Could not run tshark binary '%s'. The tshark binary is required to run termshark.\n", tsharkBin) +
+					fmt.Sprintf("Check your config file %s\n", ConfFile("toml")),
+			})
+			return "", &err
+		}
+	} else {
+		tsharkBin = "tshark"
+		if !IsCommandInPath(tsharkBin) {
+			// This message is for an unconfigured tshark bin (via PATH) that is invalid
+			errstr := fmt.Sprintf("Could not find tshark in your PATH. The tshark binary is required to run termshark.\n")
+			if strings.Contains(os.Getenv("PREFIX"), "com.termux") {
+				errstr += fmt.Sprintf("Try installing with: pkg install root-repo && pkg install tshark")
+			} else if IsCommandInPath("apt") {
+				errstr += fmt.Sprintf("Try installing with: apt install tshark")
+			} else if IsCommandInPath("apt-get") {
+				errstr += fmt.Sprintf("Try installing with: apt-get install tshark")
+			} else if IsCommandInPath("yum") {
+				errstr += fmt.Sprintf("Try installing with: yum install wireshark")
+			} else if IsCommandInPath("brew") {
+				errstr += fmt.Sprintf("Try installing with: brew install wireshark")
+			}
+			errstr += "\n"
+			err := gowid.WithKVs(ConfigErr, map[string]interface{}{
+				"msg": errstr,
+			})
+			return "", &err
+		}
+	}
+	// Here we know it's in PATH
+	tsharkBin = DirOfPathCommandUnsafe(tsharkBin)
+	return tsharkBin, nil
+}
+
+func RunForExitCode(prog string, args []string, env []string) (int, error) {
 	var err error
 	exitCode := -1 // default bad
 	cmd := exec.Command(prog, args...)
+	if env != nil {
+		cmd.Env = env
+	}
+	cmd.Stdout = ioutil.Discard
+	cmd.Stderr = ioutil.Discard
 	err = cmd.Run()
 	if err != nil {
 		if exerr, ok := err.(*exec.ExitError); ok {
@@ -140,14 +303,6 @@ func RunForExitCode(prog string, args ...string) (int, error) {
 	}
 
 	return exitCode, err
-}
-
-func ConfStringSlice(name string, def []string) []string {
-	res := viper.GetStringSlice(name)
-	if res == nil {
-		res = def
-	}
-	return res
 }
 
 func ConfFile(file string) string {
@@ -164,6 +319,135 @@ func CacheDir() string {
 	stdConf := configdir.New("", "termshark")
 	dirs := stdConf.QueryFolders(configdir.Cache)
 	return dirs[0].Path
+}
+
+// A separate dir from CacheDir because I need to use inotify under some
+// circumstances for a non-existent file, meaning I need to track a directory,
+// and I don't want to be constantly triggered by log file updates.
+func PcapDir() string {
+	return path.Join(CacheDir(), "pcaps")
+}
+
+func TSharkBin() string {
+	return ConfString("main.tshark", "tshark")
+}
+
+func DumpcapBin() string {
+	return ConfString("main.dumpcap", "dumpcap")
+}
+
+func CapinfosBin() string {
+	return ConfString("main.capinfos", "capinfos")
+}
+
+// CaptureBin is the binary the user intends to use to capture
+// packets i.e. with the -i switch. This might be distinct from
+// DumpcapBin because dumpcap can't capture on extcap interfaces
+// like randpkt, but while tshark can, it can drop packets more
+// readily than dumpcap. This value is interpreted as the name
+// of a binary, resolved against PATH. Note that the default is
+// termshark - this invokes termshark in a special mode where it
+// first tries DumpcapBin, then if that fails, TSharkBin - for
+// the best of both worlds. To detect this, termshark will run
+// CaptureBin with TERMSHARK_CAPTURE_MODE=1 in the environment,
+// so when termshark itself is invoked with this in the environment,
+// it switches to capture mode.
+func CaptureBin() string {
+	if runtime.GOOS == "windows" {
+		return ConfString("main.capture-command", DumpcapBin())
+	} else {
+		return ConfString("main.capture-command", os.Args[0])
+	}
+}
+
+// PrivilegedBin returns a capture binary that may require setcap
+// privileges on Linux. This is a simple UI to cover the fact that
+// termshark's default capture method is to run dumpcap and tshark
+// as a fallback. I don't want to tell the user the capture binary
+// is termshark - that'd be confusing. We know that on Linux, termshark
+// will run dumpcap first, then fall back to tshark if needed. Only
+// dumpcap should need access to live interfaces; tshark is needed
+// for extcap interfaces only. This is used to provide advice to
+// the user if packet capture fails.
+func PrivilegedBin() string {
+	cap := CaptureBin()
+	if cap == "termshark" {
+		return DumpcapBin()
+	} else {
+		return cap
+	}
+}
+
+func TailCommand() []string {
+	def := []string{"tail", "-f", "-c", "+0"}
+	if runtime.GOOS == "windows" {
+		def = []string{os.Args[0], "--tail"}
+	}
+	return ConfStringSlice("main.tail-command", def)
+}
+
+func KeyPressIsPrintable(key gowid.IKey) bool {
+	return unicode.IsPrint(key.Rune()) && key.Modifiers() & ^tcell.ModShift == 0
+}
+
+type KeyMapping struct {
+	From vim.KeyPress
+	To   vim.KeySequence
+}
+
+func AddKeyMapping(km KeyMapping) {
+	mappings := LoadKeyMappings()
+	newMappings := make([]KeyMapping, 0)
+	for _, mapping := range mappings {
+		if mapping.From != km.From {
+			newMappings = append(newMappings, mapping)
+		}
+	}
+	newMappings = append(newMappings, km)
+	SaveKeyMappings(newMappings)
+}
+
+func RemoveKeyMapping(kp vim.KeyPress) {
+	mappings := LoadKeyMappings()
+	newMappings := make([]KeyMapping, 0)
+	for _, mapping := range mappings {
+		if mapping.From != kp {
+			newMappings = append(newMappings, mapping)
+		}
+	}
+	SaveKeyMappings(newMappings)
+}
+
+func LoadKeyMappings() []KeyMapping {
+	mappings := ConfStringSlice("main.key-mappings", []string{})
+	res := make([]KeyMapping, 0)
+	for _, mapping := range mappings {
+		pair := strings.Split(mapping, " ")
+		if len(pair) != 2 {
+			log.Warnf("Could not parse vim key mapping (missing separator?): %s", mapping)
+			continue
+		}
+		from := vim.VimStringToKeys(pair[0])
+		if len(from) != 1 {
+			log.Warnf("Could not parse 'source' vim keypress: %s", pair[0])
+			continue
+		}
+		to := vim.VimStringToKeys(pair[1])
+		if len(to) < 1 {
+			log.Warnf("Could not parse 'target' vim keypresses: %s", pair[1])
+			continue
+		}
+		res = append(res, KeyMapping{From: from[0], To: to})
+	}
+	return res
+}
+
+func SaveKeyMappings(mappings []KeyMapping) {
+	ser := make([]string, 0, len(mappings))
+	for _, mapping := range mappings {
+		ser = append(ser, fmt.Sprintf("%v %v", mapping.From, vim.KeySequence(mapping.To)))
+	}
+	SetConf("main.key-mappings", ser)
 }
 
 func RemoveFromStringSlice(pcap string, comps []string) []string {
@@ -226,11 +510,11 @@ func ReadGob(filePath string, object interface{}) error {
 	file, err := os.Open(filePath)
 	if err == nil {
 		defer file.Close()
-		var gr io.Reader
-		gr, err = gzip.NewReader(file)
+		gr, err := gzip.NewReader(file)
 		if err != nil {
 			return err
 		}
+		defer gr.Close()
 		decoder := gob.NewDecoder(gr)
 		err = decoder.Decode(object)
 	}
@@ -320,7 +604,19 @@ func KillIfPossible(p IProcess) error {
 		return nil
 	}
 	err := p.Kill()
-	return err
+	if errProcessAlreadyFinished(err) {
+		return nil
+	} else {
+		return err
+	}
+}
+
+func errProcessAlreadyFinished(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Terrible hack - but the error isn't published
+	return err.Error() == "os: process already finished"
 }
 
 func SafePid(p IProcess) int {
@@ -328,6 +624,200 @@ func SafePid(p IProcess) int {
 		return -1
 	}
 	return p.Pid()
+}
+
+func SetConvTypes(convs []string) {
+	SetConf("main.conv-types", convs)
+}
+
+func ConvTypes() []string {
+	defs := []string{"eth", "ip", "ipv6", "tcp", "udp"}
+	ctypes := ConfStrings("main.conv-types")
+	if len(ctypes) > 0 {
+		z, ok := arrayOperations.Intersect(defs, ctypes)
+		if ok {
+			res, ok := z.Interface().([]string)
+			if ok {
+				return res
+			}
+		}
+	}
+	return defs
+}
+
+func AddToRecentFiles(pcap string) {
+	comps := ConfStrings("main.recent-files")
+	if len(comps) == 0 || comps[0] != pcap {
+		comps = RemoveFromStringSlice(pcap, comps)
+		if len(comps) > 16 {
+			comps = comps[0 : 16-1]
+		}
+		SetConf("main.recent-files", comps)
+	}
+}
+
+func AddToRecentFilters(val string) {
+	comps := ConfStrings("main.recent-filters")
+	if (len(comps) == 0 || comps[0] != val) && strings.TrimSpace(val) != "" {
+		comps = RemoveFromStringSlice(val, comps)
+		if len(comps) > 64 {
+			comps = comps[0 : 64-1]
+		}
+		SetConf("main.recent-filters", comps)
+	}
+}
+
+func LoadOffsetFromConfig(name string) ([]resizable.Offset, error) {
+	offsStr := ConfString("main."+name, "")
+	if offsStr == "" {
+		return nil, errors.WithStack(gowid.WithKVs(ConfigErr, map[string]interface{}{
+			"name": name,
+			"msg":  "No offsets found",
+		}))
+	}
+	res := make([]resizable.Offset, 0)
+	err := json.Unmarshal([]byte(offsStr), &res)
+	if err != nil {
+		return nil, errors.WithStack(gowid.WithKVs(ConfigErr, map[string]interface{}{
+			"name": name,
+			"msg":  "Could not unmarshal offsets",
+		}))
+	}
+	return res, nil
+}
+
+func SaveOffsetToConfig(name string, offsets2 []resizable.Offset) {
+	offsets := make([]resizable.Offset, 0)
+	for _, off := range offsets2 {
+		if off.Adjust != 0 {
+			offsets = append(offsets, off)
+		}
+	}
+	if len(offsets) == 0 {
+		DeleteConf("main." + name)
+	} else {
+		offs, err := json.Marshal(offsets)
+		if err != nil {
+			log.Fatal(err)
+		}
+		SetConf("main."+name, string(offs))
+	}
+	// Hack to make viper save if I only deleted from the map
+	SetConf("main.lastupdate", time.Now().String())
+}
+
+//======================================================================
+
+// Need to publish fields for template use
+type JumpPos struct {
+	Summary string `json:"summary"`
+	Pos     int    `json:"position"`
+}
+
+type GlobalJumpPos struct {
+	JumpPos
+	Filename string `json:"filename"`
+}
+
+// For ease of use in the template
+func (g GlobalJumpPos) Base() string {
+	return filepath.Base(g.Filename)
+}
+
+type globalJumpPosMapping struct {
+	Key           rune `json:"key"`
+	GlobalJumpPos      // embedding without a field name makes the json more concise
+}
+
+func LoadGlobalMarks(m map[rune]GlobalJumpPos) error {
+	marksStr := ConfString("main.marks", "")
+	if marksStr == "" {
+		return nil
+	}
+
+	mappings := make([]globalJumpPosMapping, 0)
+	err := json.Unmarshal([]byte(marksStr), &mappings)
+	if err != nil {
+		return errors.WithStack(gowid.WithKVs(ConfigErr, map[string]interface{}{
+			"name": "marks",
+			"msg":  "Could not unmarshal marks",
+		}))
+	}
+
+	for _, mapping := range mappings {
+		m[mapping.Key] = mapping.GlobalJumpPos
+	}
+
+	return nil
+}
+
+func SaveGlobalMarks(m map[rune]GlobalJumpPos) {
+	marks := make([]globalJumpPosMapping, 0)
+	for k, v := range m {
+		marks = append(marks, globalJumpPosMapping{Key: k, GlobalJumpPos: v})
+	}
+	if len(marks) == 0 {
+		DeleteConf("main.marks")
+	} else {
+		marksJ, err := json.Marshal(marks)
+		if err != nil {
+			log.Fatal(err)
+		}
+		SetConf("main.marks", string(marksJ))
+	}
+	// Hack to make viper save if I only deleted from the map
+	SetConf("main.lastupdate", time.Now().String())
+}
+
+//======================================================================
+
+var cpuProfileRunning *abool.AtomicBool
+
+func init() {
+	cpuProfileRunning = abool.New()
+}
+
+// Down to the second for profiling, etc
+func DateStringForFilename() string {
+	return time.Now().Format("2006-01-02--15-04-05")
+}
+
+func ProfileCPUFor(secs int) bool {
+	if !cpuProfileRunning.SetToIf(false, true) {
+		log.Infof("CPU profile already running.")
+		return false
+	}
+	file := filepath.Join(CacheDir(), fmt.Sprintf("cpu-%s.prof", DateStringForFilename()))
+	log.Infof("Starting CPU profile for %d seconds in %s", secs, file)
+	gwutil.StartProfilingCPU(file)
+	go func() {
+		time.Sleep(time.Duration(secs) * time.Second)
+		log.Infof("Stopping CPU profile")
+		gwutil.StopProfilingCPU()
+		cpuProfileRunning.UnSet()
+	}()
+
+	return true
+}
+
+func ProfileHeap() {
+	file := filepath.Join(CacheDir(), fmt.Sprintf("mem-%s.prof", DateStringForFilename()))
+	log.Infof("Creating memory profile in %s", file)
+	gwutil.ProfileHeap(file)
+}
+
+func LocalIPs() []string {
+	res := make([]string, 0)
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return res
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			res = append(res, ipnet.IP.String())
+		}
+	}
+	return res
 }
 
 //======================================================================
@@ -381,7 +871,7 @@ var UnexpectedOutput = fmt.Errorf("Unexpected output")
 // Use tshark's output, becauses the indices can then be used to select
 // an interface to sniff on, and net.Interfaces returns the interfaces in
 // a different order.
-func Interfaces() ([]string, error) {
+func Interfaces() (map[int][]string, error) {
 	cmd := exec.Command(TSharkBin(), "-D")
 	out, err := cmd.Output()
 	if err != nil {
@@ -390,19 +880,46 @@ func Interfaces() ([]string, error) {
 	return interfacesFrom(bytes.NewReader(out))
 }
 
-func interfacesFrom(reader io.Reader) ([]string, error) {
-	res := make([]string, 0, 20)
+func interfacesFrom(reader io.Reader) (map[int][]string, error) {
+	re := regexp.MustCompile(`^(?P<index>[0-9]+)\.\s+(?P<name1>[^\s]+)(\s*\((?P<name2>[^)]+)\))?`)
+
+	res := make(map[int][]string)
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		line := scanner.Text()
-		pieces := strings.Fields(line)
-		if len(pieces) < 2 {
+
+		match := re.FindStringSubmatch(line)
+		if len(match) < 2 {
 			return nil, gowid.WithKVs(UnexpectedOutput, map[string]interface{}{"Output": line})
 		}
-		res = append(res, pieces[1])
+		result := make(map[string]string)
+		for i, name := range re.SubexpNames() {
+			if i != 0 && match[i] != "" {
+				result[name] = match[i]
+			}
+		}
+
+		i, err := strconv.ParseInt(result["index"], 10, 32)
+		if err != nil {
+			return nil, gowid.WithKVs(UnexpectedOutput, map[string]interface{}{"Output": line})
+		}
+
+		val := make([]string, 0)
+		val = append(val, result["name1"])
+
+		if name2, ok := result["name2"]; ok {
+			val = append([]string{name2}, val...)
+		}
+		res[int(i)] = val
 	}
 
 	return res, nil
+}
+
+//======================================================================
+
+func IsTerminal(fd uintptr) bool {
+	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
 }
 
 //======================================================================
@@ -439,6 +956,215 @@ func fixNewlines(unix []byte) []byte {
 	}
 
 	return bytes.Replace(unix, []byte{'\n'}, []byte{'\r', '\n'}, -1)
+}
+
+//======================================================================
+
+type iWrappedError interface {
+	Cause() error
+}
+
+func RootCause(err error) error {
+	res := err
+	for {
+		if cerr, ok := res.(iWrappedError); ok {
+			res = cerr.Cause()
+		} else {
+			break
+		}
+	}
+	return res
+}
+
+//======================================================================
+
+func RunningRemotely() bool {
+	return os.Getenv("SSH_TTY") != ""
+}
+
+// ApplyArguments turns ["echo", "hello", "$2"] + ["big", "world"] into
+// ["echo", "hello", "world"]
+func ApplyArguments(cmd []string, args []string) ([]string, int) {
+	total := 0
+	re := regexp.MustCompile("^\\$([1-9][0-9]{0,4})$")
+	res := make([]string, len(cmd))
+	for i, c := range cmd {
+		changed := false
+		matches := re.FindStringSubmatch(c)
+		if len(matches) > 1 {
+			unum, _ := strconv.ParseUint(matches[1], 10, 32)
+			num := int(unum)
+			num -= 1 // 1 indexed
+			if num < len(args) {
+				res[i] = args[num]
+				changed = true
+				total += 1
+			}
+		}
+		if !changed {
+			res[i] = c
+		}
+	}
+	return res, total
+}
+
+func BrowseUrl(url string) error {
+	urlCmd := ConfStringSlice(
+		"main.browse-command",
+		system.OpenURL,
+	)
+
+	if len(urlCmd) == 0 {
+		return errors.WithStack(gowid.WithKVs(BadCommand, map[string]interface{}{"message": "browse command is nil"}))
+	}
+
+	urlCmdPP, changed := ApplyArguments(urlCmd, []string{url})
+	if changed == 0 {
+		urlCmdPP = append(urlCmd, url)
+	}
+
+	cmd := exec.Command(urlCmdPP[0], urlCmdPP[1:]...)
+
+	return cmd.Run()
+}
+
+//======================================================================
+
+type KeyState struct {
+	NumberPrefix    int
+	PartialgCmd     bool
+	PartialZCmd     bool
+	PartialCtrlWCmd bool
+	PartialmCmd     bool
+	PartialQuoteCmd bool
+}
+
+//======================================================================
+
+type ICommandOutput interface {
+	ProcessOutput(output string) error
+}
+
+type ICommandError interface {
+	ProcessCommandError(err error) error
+}
+
+type ICommandDone interface {
+	ProcessCommandDone()
+}
+
+type ICommandKillError interface {
+	ProcessKillError(err error) error
+}
+
+type ICommandTimeout interface {
+	ProcessCommandTimeout() error
+}
+
+type ICommandWaitTicker interface {
+	ProcessWaitTick() error
+}
+
+func CopyCommand(input io.Reader, cb interface{}) error {
+	var err error
+
+	copyCmd := ConfStringSlice(
+		"main.copy-command",
+		system.CopyToClipboard,
+	)
+
+	if len(copyCmd) == 0 {
+		return errors.WithStack(gowid.WithKVs(BadCommand, map[string]interface{}{"message": "copy command is nil"}))
+	}
+
+	cmd := exec.Command(copyCmd[0], copyCmd[1:]...)
+	cmd.Stdin = input
+	outBuf := bytes.Buffer{}
+	cmd.Stdout = &outBuf
+
+	cmdTimeout := ConfInt("main.copy-command-timeout", 5)
+	if err := cmd.Start(); err != nil {
+		return errors.WithStack(gowid.WithKVs(BadCommand, map[string]interface{}{"err": err}))
+	}
+
+	TrackedGo(func() {
+
+		defer func() {
+			if po, ok := cb.(ICommandDone); ok {
+				po.ProcessCommandDone()
+			}
+		}()
+
+		done := make(chan error, 1)
+		go func() {
+			done <- cmd.Wait()
+		}()
+
+		tick := time.NewTicker(time.Duration(200) * time.Millisecond)
+		defer tick.Stop()
+		tchan := time.After(time.Duration(cmdTimeout) * time.Second)
+
+	Loop:
+		for {
+			select {
+			case <-tick.C:
+				if po, ok := cb.(ICommandWaitTicker); ok {
+					err = po.ProcessWaitTick()
+					if err != nil {
+						break Loop
+					}
+				}
+
+			case <-tchan:
+				if err := cmd.Process.Kill(); err != nil {
+					if po, ok := cb.(ICommandKillError); ok {
+						err = po.ProcessKillError(err)
+						if err != nil {
+							break Loop
+						}
+					}
+				} else {
+					if po, ok := cb.(ICommandTimeout); ok {
+						err = po.ProcessCommandTimeout()
+						if err != nil {
+							break Loop
+						}
+					}
+				}
+				break Loop
+
+			case err := <-done:
+				if err != nil {
+					if po, ok := cb.(ICommandError); ok {
+						po.ProcessCommandError(err)
+					}
+				} else {
+					if po, ok := cb.(ICommandOutput); ok {
+						outStr := outBuf.String()
+						po.ProcessOutput(outStr)
+					}
+				}
+				break Loop
+			}
+		}
+
+	})
+
+	return nil
+}
+
+// Returns true if error, too
+func FileSizeDifferentTo(filename string, cur int64) (int64, bool) {
+	var newSize int64
+	diff := true
+	fi, err := os.Stat(filename)
+	if err == nil {
+		newSize = fi.Size()
+		if cur == newSize {
+			diff = false
+		}
+	}
+	return newSize, diff
 }
 
 //======================================================================

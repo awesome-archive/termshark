@@ -1,4 +1,4 @@
-// Copyright 2019 Graham Clark. All rights reserved.  Use of this source
+// Copyright 2019-2020 Graham Clark. All rights reserved.  Use of this source
 // code is governed by the MIT license that can be found in the LICENSE
 // file.
 
@@ -9,10 +9,26 @@ import (
 	"testing"
 
 	"github.com/blang/semver"
+	"github.com/gcla/termshark/v2/format"
 	"github.com/stretchr/testify/assert"
 )
 
 //======================================================================
+
+func TestApplyArgs(t *testing.T) {
+	cmd := []string{"echo", "something", "$3", "else", "$1", "$3"}
+	args := []string{"a1", "a2"}
+	eres := []string{"echo", "something", "$3", "else", "a1", "$3"}
+	res, total := ApplyArguments(cmd, args)
+	assert.Equal(t, eres, res)
+	assert.Equal(t, total, 1)
+
+	args = []string{"a1", "a2", "a3"}
+	eres = []string{"echo", "something", "a3", "else", "a1", "a3"}
+	res, total = ApplyArguments(cmd, args)
+	assert.Equal(t, eres, res)
+	assert.Equal(t, total, 3)
+}
 
 func TestArgConv(t *testing.T) {
 	var tests = []struct {
@@ -75,17 +91,63 @@ func TestInterfaces1(t *testing.T) {
 	out1 := `
 1. \Device\NPF_{BAC1CFBD-DE27-4023-B478-0C490B99DC5E} (Local Area Connection 2)
 2. \Device\NPF_{78032B7E-4968-42D3-9F37-287EA86C0AAA} (Local Area Connection* 10)
-3. \Device\NPF_NdisWanIp (NdisWan Adapter)
-4. \Device\NPF_NdisWanBh (NdisWan Adapter)
-5. \Device\NPF_{84E7CAE6-E96F-4F31-96FD-170B0F514AB2} (Npcap Loopback Adapter)
-6. \Device\NPF_NdisWanIpv6 (NdisWan Adapter)
-7. \Device\NPF_{503E1F71-C57C-438D-B004-EA5563723C16} (Local Area Connection 5)
-8. \Device\NPF_{15DDE443-C208-4328-8919-9666682EE804} (Local Area Connection* 11)
+3. \Device\NPF_{84E7CAE6-E96F-4F31-96FD-170B0F514AB2} (Npcap Loopback Adapter)
+4. \Device\NPF_NdisWanIpv6 (NdisWan Adapter)
+5. \Device\NPF_{503E1F71-C57C-438D-B004-EA5563723C16} (Local Area Connection 5)
+6. \Device\NPF_{15DDE443-C208-4328-8919-9666682EE804} (Local Area Connection* 11)
 `[1:]
 	interfaces, err := interfacesFrom(bytes.NewReader([]byte(out1)))
 	assert.NoError(t, err)
-	assert.Equal(t, 8, len(interfaces))
-	assert.Equal(t, `\Device\NPF_{78032B7E-4968-42D3-9F37-287EA86C0AAA}`, interfaces[1])
+	assert.Equal(t, 6, len(interfaces))
+	v := interfaces[2]
+	assert.Equal(t, `\Device\NPF_{78032B7E-4968-42D3-9F37-287EA86C0AAA}`, v[1])
+	assert.Equal(t, `Local Area Connection* 10`, v[0])
+}
+
+func TestInterfaces2(t *testing.T) {
+	out1 := `
+1. eth0
+2. ham0
+3. docker0
+4. vethd45103d
+5. lo (Loopback)
+6. mpqemubr0-dummy
+7. nflog
+8. nfqueue
+9. bluetooth0
+10. virbr0-nic
+11. vboxnet0
+12. ciscodump (Cisco remote capture)
+13. dpauxmon (DisplayPort AUX channel monitor capture)
+14. randpkt (Random packet generator)
+15. sdjournal (systemd Journal Export)
+16. sshdump (SSH remote capture)
+17. udpdump (UDP Listener remote capture)
+`[1:]
+	interfaces, err := interfacesFrom(bytes.NewReader([]byte(out1)))
+	assert.NoError(t, err)
+	assert.Equal(t, 17, len(interfaces))
+	v := interfaces[3]
+	assert.Equal(t, `docker0`, v[0])
+	v = interfaces[12]
+	assert.Equal(t, `Cisco remote capture`, v[0])
+	assert.Equal(t, `ciscodump`, v[1])
+}
+
+func TestConv1(t *testing.T) {
+	var tests = []struct {
+		arg string
+		res string
+	}{
+		{"hello\x41world\x42", "helloAworldB"},
+		{"80 \xe2\x86\x92 53347", "80 → 53347"},
+		{"hello\x41world\x42 foo \\000 bar", "helloAworldB foo \\000 bar"},
+	}
+
+	for _, test := range tests {
+		outs := format.TranslateHexCodes([]byte(test.arg))
+		assert.Equal(t, string(outs), test.res)
+	}
 }
 
 //======================================================================

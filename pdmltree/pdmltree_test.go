@@ -1,4 +1,4 @@
-// Copyright 2019 Graham Clark. All rights reserved.  Use of this source code is governed by the MIT license
+// Copyright 2019-2020 Graham Clark. All rights reserved.  Use of this source code is governed by the MIT license
 // that can be found in the LICENSE file.
 
 package pdmltree
@@ -197,7 +197,9 @@ var p1 string = `<packet>
 
 func TestPdml1(t *testing.T) {
 
+	dummy := make(ExpandedPaths, 0)
 	tree := DecodePacket([]byte(p1))
+	tree.ApplyExpandedPaths(&dummy)
 
 	assert.Equal(t, 8, len(tree.Children_))
 	assert.Equal(t, 13, len(tree.Children_[0].Children_))

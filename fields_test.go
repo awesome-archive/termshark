@@ -1,4 +1,4 @@
-// Copyright 2019 Graham Clark. All rights reserved.  Use of this source code is governed by the MIT license
+// Copyright 2019-2020 Graham Clark. All rights reserved.  Use of this source code is governed by the MIT license
 // that can be found in the LICENSE file.
 
 package termshark
@@ -14,7 +14,7 @@ import (
 func TestFields1(t *testing.T) {
 
 	fields := NewFields()
-	err := fields.Init()
+	err := fields.InitNoCache()
 	assert.NoError(t, err)
 
 	m1, ok := fields.fields.M["tcp"]

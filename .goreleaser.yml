@@ -9,21 +9,36 @@ builds:
   main: ./cmd/termshark/termshark.go
   goos:
     - freebsd
+    - netbsd
+    - openbsd
     - windows
     - linux
     - darwin
   goarch:
     - arm
+    - arm64
     - amd64
   ignore:
     - goos: darwin
       goarch: arm
     - goos: freebsd
       goarch: arm
+    - goos: netbsd
+      goarch: arm
+    - goos: openbsd
+      goarch: arm
     - goos: windows
       goarch: arm
-  ldflags:
-    - -X github.com/gcla/termshark.Version={{.Version}}
+    - goos: darwin
+      goarch: arm64
+    - goos: freebsd
+      goarch: arm64
+    - goos: netbsd
+      goarch: arm64
+    - goos: openbsd
+      goarch: arm64
+    - goos: windows
+      goarch: arm64
 archives:
 - replacements:
     darwin: macOS
@@ -36,12 +51,12 @@ archives:
     format: zip
   files:
   - none*    
-sign:
-   artifacts: checksum
+signs:
+  - artifacts: checksum
 checksum:
   name_template: 'checksums.txt'
 snapshot:
-  name_template: "{{ .Tag }}-next"
+  name_template: "{{ .Env.TERMSHARK_GIT_DESCRIBE }}"
 changelog:
   sort: asc
   filters:

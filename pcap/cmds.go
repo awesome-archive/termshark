@@ -1,4 +1,4 @@
-// Copyright 2019 Graham Clark. All rights reserved.  Use of this source
+// Copyright 2019-2020 Graham Clark. All rights reserved.  Use of this source
 // code is governed by the MIT license that can be found in the LICENSE
 // file.
 
@@ -9,11 +9,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"runtime"
+	"strings"
 	"sync"
 
-	"github.com/gcla/termshark"
-	"github.com/pkg/errors"
+	"github.com/gcla/termshark/v2"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -26,58 +25,59 @@ type ProcessNotStarted struct {
 var _ error = ProcessNotStarted{}
 
 func (e ProcessNotStarted) Error() string {
-	return fmt.Sprintf("Process %v not started yet", e.Command)
+	return fmt.Sprintf("Process %v [%v] not started yet", e.Command.Path, strings.Join(e.Command.Args, " "))
 }
 
 //======================================================================
 
-type command struct {
+type Command struct {
 	sync.Mutex
 	*exec.Cmd
 }
 
-func (c *command) String() string {
+func (c *Command) String() string {
 	c.Lock()
 	defer c.Unlock()
 	return fmt.Sprintf("%v %v", c.Cmd.Path, c.Cmd.Args)
 }
 
-func (c *command) Start() error {
+func (c *Command) Start() error {
 	c.Lock()
 	defer c.Unlock()
 	c.Cmd.Stderr = log.StandardLogger().Writer()
+	c.PutInNewGroupOnUnix()
 	res := c.Cmd.Start()
 	return res
 }
 
-func (c *command) Wait() error {
+func (c *Command) Wait() error {
 	return c.Cmd.Wait()
 }
 
-func (c *command) StdoutPipe() (io.ReadCloser, error) {
+func (c *Command) StdoutReader() (io.ReadCloser, error) {
 	c.Lock()
 	defer c.Unlock()
 	return c.Cmd.StdoutPipe()
 }
 
-func (c *command) SetStdout(w io.Writer) {
+func (c *Command) SetStdout(w io.Writer) {
 	c.Lock()
 	defer c.Unlock()
 	c.Cmd.Stdout = w
 }
 
-func (c *command) Kill() error {
-	if c.Cmd.Process == nil {
-		return errors.WithStack(ProcessNotStarted{Command: c.Cmd})
+// If stdout supports Close(), call it. If stdout is a pipe, for example,
+// this can be used to have EOF appear on the reading side (e.g. tshark -T psml)
+func (c *Command) Close() error {
+	c.Lock()
+	defer c.Unlock()
+	if cl, ok := c.Cmd.Stdout.(io.Closer); ok {
+		return cl.Close()
 	}
-	if runtime.GOOS == "windows" {
-		return c.Cmd.Process.Kill()
-	} else {
-		return c.Cmd.Process.Signal(os.Interrupt)
-	}
+	return nil
 }
 
-func (c *command) Pid() int {
+func (c *Command) Pid() int {
 	c.Lock()
 	defer c.Unlock()
 	if c.Cmd.Process == nil {
@@ -93,31 +93,53 @@ type Commands struct {
 	Args     []string
 	PdmlArgs []string
 	PsmlArgs []string
+	Color    bool
 }
 
-func MakeCommands(decodeAs []string, args []string, pdml []string, psml []string) Commands {
+func MakeCommands(decodeAs []string, args []string, pdml []string, psml []string, color bool) Commands {
 	return Commands{
 		DecodeAs: decodeAs,
 		Args:     args,
 		PdmlArgs: pdml,
 		PsmlArgs: psml,
+		Color:    color,
 	}
 }
 
 var _ ILoaderCmds = Commands{}
 
-func (c Commands) Iface(iface string, captureFilter string, tmpfile string) IBasicCommand {
-	args := []string{"-P", "-i", iface, "-w", tmpfile}
+func (c Commands) Iface(ifaces []string, captureFilter string, tmpfile string) IBasicCommand {
+	args := make([]string, 0)
+	for _, iface := range ifaces {
+		args = append(args, "-i", iface)
+	}
+	args = append(args, "-w", tmpfile)
 	if captureFilter != "" {
 		args = append(args, "-f", captureFilter)
 	}
-	return &command{Cmd: exec.Command(termshark.DumpcapBin(), args...)}
+	res := &Command{
+		Cmd: exec.Command(termshark.CaptureBin(), args...),
+	}
+	// This tells termshark to start in a special capture mode. It allows termshark
+	// to run itself like this:
+	//
+	// termshark -i eth0 -w foo.pcap
+	//
+	// which will then run dumpcap and if that fails, tshark. The idea
+	// is to use the most specialized/efficient capture method if that
+	// works, but fall back to tshark if needed e.g. for randpkt, sshcapture, etc
+	// (extcap interfaces).
+	res.Cmd.Env = append(os.Environ(), "TERMSHARK_CAPTURE_MODE=1")
+	res.Cmd.Stdin = os.Stdin
+	res.Cmd.Stderr = os.Stderr
+	res.Cmd.Stdout = os.Stdout
+	return res
 }
 
 func (c Commands) Tail(tmpfile string) ITailCommand {
 	args := termshark.TailCommand()
 	args = append(args, tmpfile)
-	return &command{Cmd: exec.Command(args[0], args[1:]...)}
+	return &Command{Cmd: exec.Command(args[0], args[1:]...)}
 }
 
 func (c Commands) Psml(pcap interface{}, displayFilter string) IPcapCommand {
@@ -141,7 +163,7 @@ func (c Commands) Psml(pcap interface{}, displayFilter string) IPcapCommand {
 		// read from cmdline file
 		args = append(args, "-r", pcap.(string))
 	} else {
-		args = append(args, "-i", "-")
+		args = append(args, "-r", "-")
 		args = append(args, "-l") // provide data sooner to decoder routine in termshark
 	}
 
@@ -152,6 +174,9 @@ func (c Commands) Psml(pcap interface{}, displayFilter string) IPcapCommand {
 	for _, arg := range c.DecodeAs {
 		args = append(args, "-d", arg)
 	}
+	if c.Color {
+		args = append(args, "--color")
+	}
 	args = append(args, c.PsmlArgs...)
 	args = append(args, c.Args...)
 
@@ -161,21 +186,24 @@ func (c Commands) Psml(pcap interface{}, displayFilter string) IPcapCommand {
 	if fifo {
 		cmd.Stdin = pcap.(io.Reader)
 	}
-	return &command{Cmd: cmd}
+	return &Command{Cmd: cmd}
 }
 
 func (c Commands) Pcap(pcap string, displayFilter string) IPcapCommand {
 	// need to use stdout and -w - otherwise, tshark writes one-line text output
-	args := []string{"-F", "pcap", "-r", pcap, "-w", "-"}
+	args := []string{"-r", pcap, "-x"}
 	if displayFilter != "" {
 		args = append(args, "-Y", displayFilter)
 	}
 	args = append(args, c.Args...)
-	return &command{Cmd: exec.Command(termshark.TSharkBin(), args...)}
+	return &Command{Cmd: exec.Command(termshark.TSharkBin(), args...)}
 }
 
 func (c Commands) Pdml(pcap string, displayFilter string) IPcapCommand {
 	args := []string{"-T", "pdml", "-r", pcap}
+	if c.Color {
+		args = append(args, "--color")
+	}
 	if displayFilter != "" {
 		args = append(args, "-Y", displayFilter)
 	}
@@ -184,7 +212,7 @@ func (c Commands) Pdml(pcap string, displayFilter string) IPcapCommand {
 	}
 	args = append(args, c.PdmlArgs...)
 	args = append(args, c.Args...)
-	return &command{Cmd: exec.Command(termshark.TSharkBin(), args...)}
+	return &Command{Cmd: exec.Command(termshark.TSharkBin(), args...)}
 }
 
 //======================================================================

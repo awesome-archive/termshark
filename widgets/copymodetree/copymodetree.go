@@ -1,4 +1,4 @@
-// Copyright 2019 Graham Clark. All rights reserved.  Use of this source
+// Copyright 2019-2020 Graham Clark. All rights reserved.  Use of this source
 // code is governed by the MIT license that can be found in the LICENSE
 // file.
 
@@ -15,8 +15,8 @@ import (
 	"github.com/gcla/gowid"
 	"github.com/gcla/gowid/widgets/list"
 	"github.com/gcla/gowid/widgets/tree"
-	"github.com/gcla/termshark"
-	"github.com/gcla/termshark/pdmltree"
+	"github.com/gcla/termshark/v2"
+	"github.com/gcla/termshark/v2/pdmltree"
 )
 
 //======================================================================
@@ -33,6 +33,8 @@ type ITreeAndListWalker interface {
 	Tree() tree.IModel
 }
 
+// Note that tree.New() returns a *list.Widget - that's how it's implemented. So this
+// uses a list widget too.
 func New(l *list.Widget, clip gowid.IClipboardSelected) *Widget {
 	return &Widget{
 		Widget: l,
@@ -47,11 +49,11 @@ func (w *Widget) Render(size gowid.IRenderSize, focus gowid.Selector, app gowid.
 		walk := w.Walker().(ITreeAndListWalker)
 		w.SetWalker(NewWalker(walk, walk.Focus().(tree.IPos), diff, w.clip), app)
 
-		res := gowid.Render(w.Widget, size, focus, app)
+		res := w.Widget.Render(size, focus, app)
 		w.SetWalker(walk, app)
 		return res
 	} else {
-		return gowid.Render(w.Widget, size, focus, app)
+		return w.Widget.Render(size, focus, app)
 	}
 }
 

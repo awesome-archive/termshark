@@ -1,4 +1,4 @@
-// Copyright 2019 Graham Clark. All rights reserved.  Use of this source
+// Copyright 2019-2020 Graham Clark. All rights reserved.  Use of this source
 // code is governed by the MIT license that can be found in the LICENSE
 // file.
 
@@ -36,9 +36,8 @@ var _ IOffsets = (*ColumnsWidget)(nil)
 
 func NewColumns(widgets []gowid.IContainerWidget) *ColumnsWidget {
 	res := &ColumnsWidget{
-		Widget:    columns.New(widgets),
-		Offsets:   make([]Offset, 0, 2),
-		Callbacks: gowid.NewCallbacks(),
+		Widget:  columns.New(widgets),
+		Offsets: make([]Offset, 0, 2),
 	}
 	return res
 }
@@ -49,13 +48,20 @@ func (w *ColumnsWidget) GetOffsets() []Offset {
 
 func (w *ColumnsWidget) SetOffsets(offs []Offset, app gowid.IApp) {
 	w.Offsets = offs
+	gowid.RunWidgetCallbacks(w.Callbacks, OffsetsCB{}, app, w)
 }
 
 func (w *ColumnsWidget) OnOffsetsSet(cb gowid.IWidgetChangedCallback) {
+	if w.Callbacks == nil {
+		w.Callbacks = gowid.NewCallbacks()
+	}
 	gowid.AddWidgetCallback(w.Callbacks, OffsetsCB{}, cb)
 }
 
 func (w *ColumnsWidget) RemoveOnOffsetsSet(cb gowid.IIdentity) {
+	if w.Callbacks == nil {
+		w.Callbacks = gowid.NewCallbacks()
+	}
 	gowid.RemoveWidgetCallback(w.Callbacks, OffsetsCB{}, cb)
 }
 
@@ -152,6 +158,7 @@ func (w *PileWidget) GetOffsets() []Offset {
 
 func (w *PileWidget) SetOffsets(offs []Offset, app gowid.IApp) {
 	w.Offsets = offs
+	gowid.RunWidgetCallbacks(w.Callbacks, OffsetsCB{}, app, w)
 }
 
 func (w *PileWidget) OnOffsetsSet(cb gowid.IWidgetChangedCallback) {

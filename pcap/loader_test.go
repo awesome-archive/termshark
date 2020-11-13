@@ -1,4 +1,4 @@
-// Copyright 2019 Graham Clark. All rights reserved.  Use of this source code is governed by the MIT license
+// Copyright 2019-2020 Graham Clark. All rights reserved.  Use of this source code is governed by the MIT license
 // that can be found in the LICENSE file.
 
 package pcap
@@ -19,7 +19,7 @@ import (
 	_ "net/http"
 	_ "net/http/pprof"
 
-	"github.com/gcla/termshark"
+	"github.com/gcla/termshark/v2"
 	"github.com/stretchr/testify/assert"
 
 	log "github.com/sirupsen/logrus"
@@ -137,7 +137,6 @@ func (r *loopReader) Read(p []byte) (int, error) {
 // Implements io.Reader - combines header, looping body and footer from disk
 type pcapLoopReader struct {
 	io.Reader
-	loops int
 }
 
 var _ io.Reader = (*pcapLoopReader)(nil)
@@ -162,7 +161,6 @@ func newPcapLoopReader(prefix string, suffix string, loops int, stopper iStopLoo
 
 	res := &pcapLoopReader{
 		Reader: io.MultiReader(fileh, looper, filef),
-		loops:  loops,
 	}
 
 	return res
@@ -181,7 +179,7 @@ func makeProcsFromPrefix(pref string) procsFromPrefix {
 	return procsFromPrefix{prefix: pref}
 }
 
-func (g procsFromPrefix) Iface(iface string, captureFilter string, tmpfile string) IBasicCommand {
+func (g procsFromPrefix) Iface(ifaces []string, captureFilter string, tmpfile string) IBasicCommand {
 	panic(fmt.Errorf("Should not need"))
 }
 
@@ -198,7 +196,7 @@ func (g procsFromPrefix) Psml(pcap interface{}, filter string) IPcapCommand {
 }
 
 func (g procsFromPrefix) Pcap(pcap string, filter string) IPcapCommand {
-	file, err := os.Open(fmt.Sprintf("testdata/%s.pcap", g.prefix))
+	file, err := os.Open(fmt.Sprintf("testdata/%s.hexdump", g.prefix))
 	if err != nil {
 		panic(err)
 	}
@@ -226,7 +224,7 @@ func makeLoopingProcs(pref string, loops int) loopingProcs {
 	return loopingProcs{prefix: pref, loops: loops}
 }
 
-func (g loopingProcs) Iface(iface string, captureFilter string, tmpfile string) IBasicCommand {
+func (g loopingProcs) Iface(ifaces []string, captureFilter string, tmpfile string) IBasicCommand {
 	panic(fmt.Errorf("Should not need"))
 }
 
@@ -240,7 +238,7 @@ func (g loopingProcs) Psml(pcap interface{}, filter string) IPcapCommand {
 }
 
 func (g loopingProcs) Pcap(pcap string, filter string) IPcapCommand {
-	rd := newPcapLoopReader(g.prefix, "pcap", g.loops, nil)
+	rd := newPcapLoopReader(g.prefix, "hexdump", g.loops, nil)
 	return newSimpleCmd(rd)
 }
 
@@ -262,8 +260,6 @@ type simpleCmd struct {
 	ctx     context.Context // cancels the iface reader process
 	cancel  context.CancelFunc
 }
-
-var _ ICommand = (*simpleCmd)(nil)
 
 func newSimpleCmd(rd io.Reader) *simpleCmd {
 	res := &simpleCmd{}
@@ -318,11 +314,11 @@ func (f *simpleCmd) Wait() error {
 	return nil
 }
 
-func (f *simpleCmd) StdoutPipe() (io.ReadCloser, error) {
+func (f *simpleCmd) StdoutReader() (io.ReadCloser, error) {
 	return f.pipe, nil
 }
 
-func (f *simpleCmd) SetStdout(w io.Writer) {
+func (f *simpleCmd) SetStdout(w io.WriteCloser) {
 	f.out = w
 }
 
@@ -338,6 +334,10 @@ func (f *simpleCmd) Signal(s os.Signal) error {
 
 func (f *simpleCmd) Pid() int {
 	return 1001
+}
+
+func (f *simpleCmd) String() string {
+	return fmt.Sprintf("SimpleCmd: pcap=%s filter=%s", f.pcap, f.filter)
 }
 
 //======================================================================
@@ -423,7 +423,7 @@ func TestSimpleCmd(t *testing.T) {
 	err := p.Start()
 	assert.NoError(t, err)
 
-	so, err := p.StdoutPipe()
+	so, err := p.StdoutReader()
 	assert.NoError(t, err)
 
 	read, err := ioutil.ReadAll(so)

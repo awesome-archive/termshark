@@ -1,4 +1,4 @@
-// Copyright 2019 Graham Clark. All rights reserved.  Use of this source
+// Copyright 2019-2020 Graham Clark. All rights reserved.  Use of this source
 // code is governed by the MIT license that can be found in the LICENSE
 // file.
 
@@ -9,10 +9,8 @@
 package hexdumper
 
 import (
-	"bytes"
 	"encoding/hex"
 	"fmt"
-	"strings"
 	"unicode"
 
 	"github.com/gcla/gowid"
@@ -22,8 +20,9 @@ import (
 	"github.com/gcla/gowid/widgets/pile"
 	"github.com/gcla/gowid/widgets/styled"
 	"github.com/gcla/gowid/widgets/text"
-	"github.com/gcla/termshark"
-	"github.com/gcla/termshark/widgets/renderfocused"
+	"github.com/gcla/termshark/v2"
+	"github.com/gcla/termshark/v2/format"
+	"github.com/gcla/termshark/v2/widgets/renderfocused"
 	"github.com/gdamore/tcell"
 	"github.com/pkg/errors"
 )
@@ -56,6 +55,15 @@ func (h boxedText) RenderSize(size gowid.IRenderSize, focus gowid.Selector, app 
 
 //======================================================================
 
+type Options struct {
+	StyledLayers      []LayerStyler
+	CursorUnselected  string
+	CursorSelected    string
+	LineNumUnselected string
+	LineNumSelected   string
+	PaletteIfCopying  string
+}
+
 type Widget struct {
 	w                 gowid.IWidget
 	data              []byte
@@ -77,20 +85,22 @@ var _ gowid.IIdentityWidget = (*Widget)(nil)
 var _ gowid.IClipboard = (*Widget)(nil)
 var _ gowid.IClipboardSelected = (*Widget)(nil)
 
-func New(data []byte, layers []LayerStyler,
-	cursorUnselected string, cursorSelected string,
-	lineNumUnselected string, lineNumSelected string,
-	paletteIfCopying string) *Widget {
+func New(data []byte, opts ...Options) *Widget {
+
+	var opt Options
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 
 	res := &Widget{
 		data:                        data,
-		layers:                      layers,
-		cursorUnselected:            cursorUnselected,
-		cursorSelected:              cursorSelected,
-		lineNumUnselected:           lineNumUnselected,
-		lineNumSelected:             lineNumSelected,
-		paletteIfCopying:            paletteIfCopying,
-		UsePaletteIfSelectedForCopy: styled.UsePaletteIfSelectedForCopy{Entry: paletteIfCopying},
+		layers:                      opt.StyledLayers,
+		cursorUnselected:            opt.CursorUnselected,
+		cursorSelected:              opt.CursorSelected,
+		lineNumUnselected:           opt.LineNumUnselected,
+		lineNumSelected:             opt.LineNumSelected,
+		paletteIfCopying:            opt.PaletteIfCopying,
+		UsePaletteIfSelectedForCopy: styled.UsePaletteIfSelectedForCopy{Entry: opt.PaletteIfCopying},
 		Callbacks:                   gowid.NewCallbacks(),
 	}
 
@@ -101,7 +111,7 @@ func New(data []byte, layers []LayerStyler,
 			// widget (moving up the hierarchy) is the one claiming the copy
 			res.chrs[i] = boxedText{
 				width:   1,
-				IWidget: text.NewCopyable(string(rune(i)), hexChrsId{i}, styled.UsePaletteIfSelectedForCopy{Entry: paletteIfCopying}),
+				IWidget: text.NewCopyable(string(rune(i)), hexChrsId{i}, styled.UsePaletteIfSelectedForCopy{Entry: opt.PaletteIfCopying}),
 			}
 		}
 	}
@@ -290,7 +300,7 @@ func (d privateId) ID() interface{} {
 
 func (d privateId) Render(size gowid.IRenderSize, focus gowid.Selector, app gowid.IApp) gowid.ICanvas {
 	// Skip the embedded Widget to avoid a loop
-	return gowid.Render(d.w, size, focus, app)
+	return d.w.Render(size, focus, app)
 }
 
 func (w *Widget) Render(size gowid.IRenderSize, focus gowid.Selector, app gowid.IApp) gowid.ICanvas {
@@ -307,48 +317,17 @@ func (w *Widget) Render(size gowid.IRenderSize, focus gowid.Selector, app gowid.
 			}
 			wa = palettemap.New(privateId{w}, layerConv, layerConv)
 		}
-		return gowid.Render(wa, size, focus, app)
+		return wa.Render(size, focus, app)
 	} else {
-		return gowid.Render(w.w, size, focus, app)
+		return w.w.Render(size, focus, app)
 	}
-}
-
-func MakeEscapedString(data []byte) string {
-	res := make([]string, 0)
-	var buffer bytes.Buffer
-	for i := 0; i < len(data); i++ {
-		buffer.WriteString(fmt.Sprintf("\\x%02x", data[i]))
-		if i%16 == 16-1 || i+1 == len(data) {
-			res = append(res, fmt.Sprintf("\"%s\"", buffer.String()))
-			buffer.Reset()
-		}
-	}
-	return strings.Join(res, " \\\n")
-}
-
-func MakeHexStream(data []byte) string {
-	var buffer bytes.Buffer
-	for i := 0; i < len(data); i++ {
-		buffer.WriteString(fmt.Sprintf("%02x", data[i]))
-	}
-	return buffer.String()
-}
-
-func MakePrintableString(data []byte) string {
-	var buffer bytes.Buffer
-	for i := 0; i < len(data); i++ {
-		if unicode.IsPrint(rune(data[i])) {
-			buffer.WriteString(string(rune(data[i])))
-		}
-	}
-	return buffer.String()
 }
 
 func clipsForBytes(data []byte, start int, end int) []gowid.ICopyResult {
 	dump := hex.Dump(data[start:end])
-	dump2 := MakeEscapedString(data[start:end])
-	dump3 := MakePrintableString(data[start:end])
-	dump4 := MakeHexStream(data[start:end])
+	dump2 := format.MakeEscapedString(data[start:end])
+	dump3 := format.MakePrintableString(data[start:end])
+	dump4 := format.MakeHexStream(data[start:end])
 
 	return []gowid.ICopyResult{
 		gowid.CopyResult{
@@ -390,7 +369,7 @@ func (w *Widget) UserInput(ev interface{}, size gowid.IRenderSize, focus gowid.S
 		} else {
 			cl := app.CopyLevel()
 			app.CopyLevel(cl + len(w.Layers()) + 1) // this is how many levels hexdumper will support
-			res = gowid.UserInput(w.w, ev, size, focus, app)
+			res = w.w.UserInput(ev, size, focus, app)
 			app.CopyLevel(cl)
 
 			if !res {
@@ -403,7 +382,7 @@ func (w *Widget) UserInput(ev interface{}, size gowid.IRenderSize, focus gowid.S
 		res = true
 	} else {
 		cur := w.Position()
-		res = gowid.UserInput(w.w, ev, size, focus, app)
+		res = w.w.UserInput(ev, size, focus, app)
 
 		if res {
 			newpos := w.Position()

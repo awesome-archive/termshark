@@ -1,25 +1,31 @@
-// Copyright 2019 Graham Clark. All rights reserved.  Use of this source
+// Copyright 2019-2020 Graham Clark. All rights reserved.  Use of this source
 // code is governed by the MIT license that can be found in the LICENSE
 // file.
 
-// A demonstration of gowid's tree widget.
+// Package pdmltree contains a type used as the model for a PDML document for a
+// packet, and associated functions.
 package pdmltree
 
 import (
 	"bytes"
 	"encoding/xml"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 
+	"github.com/antchfx/xmlquery"
 	"github.com/gcla/gowid"
+	"github.com/gcla/gowid/gwutil"
 	"github.com/gcla/gowid/widgets/tree"
-	"github.com/gcla/termshark/widgets/hexdumper"
+	"github.com/gcla/termshark/v2/widgets/hexdumper2"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
 
 //======================================================================
+
+type ExpandedPaths [][]string
 
 type EmptyIterator struct{}
 
@@ -51,44 +57,49 @@ func (p *Iterator) Value() tree.IModel {
 	return p.tree.Children_[p.pos-1]
 }
 
+// Model is a struct model of the PDML proto or field element.
 type Model struct {
-	UiName    string            `xml:"-"`
-	Name      string            `xml:"-"` // needed for stripping geninfp from UI
-	Expanded  bool              `xml:"-"`
-	Pos       int               `xml:"-"`
-	Size      int               `xml:"-"`
-	Hide      bool              `xml:"-"`
-	Children_ []*Model          `xml:",any"`
-	Content   []byte            `xml:",innerxml"` // needed for copying PDML to clipboard
-	NodeName  string            `xml:"-"`
-	Attrs     map[string]string `xml:"-"`
+	UiName         string            `xml:"-"`
+	Name           string            `xml:"-"` // needed for stripping geninfo from UI
+	Expanded       bool              `xml:"-"`
+	Pos            int               `xml:"-"`
+	Size           int               `xml:"-"`
+	Hide           bool              `xml:"-"`
+	Children_      []*Model          `xml:",any"`
+	Content        []byte            `xml:",innerxml"` // needed for copying PDML to clipboard
+	NodeName       string            `xml:"-"`
+	Attrs          map[string]string `xml:"-"`
+	QueryModel     *xmlquery.Node    `xml:"-"`
+	Parent         *Model            `xml:"-"`
+	ExpandedFields *ExpandedPaths    `xml:"-"`
 }
 
 var _ tree.IModel = (*Model)(nil)
+var _ tree.ICollapsible = (*Model)(nil)
 
 // This ignores the first child, "Frame 15", because its range covers the whole packet
 // which results in me always including that in the layers for any position.
-func (n *Model) HexLayers(pos int, includeFirst bool) []hexdumper.LayerStyler {
-	res := make([]hexdumper.LayerStyler, 0)
+func (n *Model) HexLayers(pos int, includeFirst bool) []hexdumper2.LayerStyler {
+	res := make([]hexdumper2.LayerStyler, 0)
 	sidx := 1
 	if includeFirst {
 		sidx = 0
 	}
 	for _, c := range n.Children_[sidx:] {
 		if c.Pos <= pos && pos < c.Pos+c.Size {
-			res = append(res, hexdumper.LayerStyler{
+			res = append(res, hexdumper2.LayerStyler{
 				Start:         c.Pos,
 				End:           c.Pos + c.Size,
-				ColUnselected: "hex-bottom-unselected",
-				ColSelected:   "hex-bottom-selected",
+				ColUnselected: "hex-layer-unselected",
+				ColSelected:   "hex-layer-selected",
 			})
 			for _, c2 := range c.Children_ {
 				if c2.Pos <= pos && pos < c2.Pos+c2.Size {
-					res = append(res, hexdumper.LayerStyler{
+					res = append(res, hexdumper2.LayerStyler{
 						Start:         c2.Pos,
 						End:           c2.Pos + c2.Size,
-						ColUnselected: "hex-top-unselected",
-						ColSelected:   "hex-top-selected",
+						ColUnselected: "hex-field-unselected",
+						ColSelected:   "hex-field-selected",
 					})
 				}
 			}
@@ -97,7 +108,8 @@ func (n *Model) HexLayers(pos int, includeFirst bool) []hexdumper.LayerStyler {
 	return res
 }
 
-// Implement xml.Unmarshaler
+// Implement xml.Unmarshaler. Create a Model struct by unmarshaling the
+// provided XML. Takes special action before deferring to DecodeElement.
 func (n *Model) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 	var err error
 	n.Attrs = map[string]string{}
@@ -131,9 +143,12 @@ func (n *Model) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 
 	type pt Model
 	res := d.DecodeElement((*pt)(n), &start)
+
 	return res
 }
 
+// Make a *Model from the slice of bytes, and expand nodes according
+// to the map parameter.
 func DecodePacket(data []byte) *Model { // nil if failure
 	d := xml.NewDecoder(bytes.NewReader(data))
 
@@ -145,7 +160,81 @@ func DecodePacket(data []byte) *Model { // nil if failure
 	}
 
 	tr := n.removeUnneeded()
+
+	// Have to make this here because this is when I have access to the data...
+	n.QueryModel, err = xmlquery.Parse(strings.NewReader(string(data)))
+	if err != nil {
+		log.Error(err)
+	}
+
 	return tr
+}
+
+func (p *Model) TCPStreamIndex() gwutil.IntOption {
+	return p.streamIndex("tcp")
+}
+
+func (p *Model) UDPStreamIndex() gwutil.IntOption {
+	return p.streamIndex("udp")
+}
+
+// Return None if not TCP
+func (p *Model) streamIndex(proto string) gwutil.IntOption {
+	var res gwutil.IntOption
+	if showNode := xmlquery.FindOne(p.QueryModel, fmt.Sprintf("//field[@name='%s.stream']/@show", proto)); showNode != nil {
+		idx, err := strconv.Atoi(showNode.InnerText())
+		if err != nil {
+			log.Warnf("Unexpected %s node innertext value %s", proto, showNode.InnerText())
+		} else {
+			res = gwutil.SomeInt(idx)
+		}
+	}
+	return res
+}
+
+func (p *Model) ApplyExpandedPaths(exp *ExpandedPaths) {
+	if exp != nil {
+		p.makeParentLinks(exp) // TODO - fixup
+		p.expandAllPaths(*exp)
+	}
+}
+
+func (p *Model) expandAllPaths(exp ExpandedPaths) {
+	for _, path := range exp {
+		// path is [udp, udp.srcport,...]
+		p.expandByPath(path)
+	}
+}
+
+func (p *Model) expandByPath(path []string) {
+	if len(path) == 0 {
+		return
+	}
+	p2 := path[0]
+	if p.Name == p2 {
+		subpath := path[1:]
+		if len(subpath) == 0 {
+			// Only explicitly expand the leaf - the paths must include
+			// a path ending at each node along the way for a complete path
+			// expansion. This lets us collapse root nodes and preserve the
+			// state of inner nodes
+			p.Expanded = true
+		} else {
+			for _, ch := range p.Children_ {
+				ch.expandByPath(subpath)
+			}
+		}
+	}
+}
+
+func (p *Model) makeParentLinks(exp *ExpandedPaths) {
+	if p != nil {
+		p.ExpandedFields = exp
+		for _, ch := range p.Children_ {
+			ch.Parent = p
+			ch.makeParentLinks(exp)
+		}
+	}
 }
 
 func (p *Model) removeUnneeded() *Model {
@@ -207,27 +296,54 @@ func (p *Model) stringAt(level int) string {
 	}
 }
 
-//func (p *Model) Children() tree.IIterator {
-//}
+func (p *Model) PathToRoot() []string {
+	if p == nil {
+		return []string{}
+	}
+	return append(p.Parent.PathToRoot(), p.Name)
+}
 
 func (p *Model) IsCollapsed() bool {
-	//return false
 	return !p.Expanded
-	// fp := d.FullPath()
-	// if v, res := (*d.cache)[fp]; res {
-	// 	return (v == collapsed)
-	// } else {
-	// 	return true
-	// }
 }
 
 func (p *Model) SetCollapsed(app gowid.IApp, isCollapsed bool) {
-	// fp := d.FullPath()
 	if isCollapsed {
 		p.Expanded = false
 	} else {
 		p.Expanded = true
 	}
+	path := p.PathToRoot()
+	if p.Expanded {
+		// We need to add an expanded entry for [/], [/, tcp], [/, tcp, tcp.srcport] - because
+		// expanding a node implicitly expands all parent nodes. But contracting an outer node
+		// should leave the expanded state of inner nodes alone.
+		for i := 0; i < len(path); i++ {
+			p.ExpandedFields.addExpanded(path[0 : i+1])
+		}
+	} else {
+		p.ExpandedFields.removeExpanded(path)
+	}
+}
+
+func (m *ExpandedPaths) addExpanded(path []string) bool {
+	for _, p := range *m {
+		if reflect.DeepEqual(p, path) {
+			return false
+		}
+	}
+	*m = append(*m, path)
+	return true
+}
+
+func (m *ExpandedPaths) removeExpanded(path []string) bool {
+	for i, p := range *m {
+		if reflect.DeepEqual(p, path) {
+			*m = append((*m)[:i], (*m)[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 //======================================================================
